@@ -1,8 +1,15 @@
-"""Evaluate a trained group-structured world model.
+"""Evaluate a trained recurrent group-structured world model.
 
-Checks that the model isn't just fitting one-step prediction -- it also
-inspects the algebraic structure the network discovered: does turn_left have
-cyclic order 4, and is turn_right its inverse?
+Reports two different things and does not conflate them:
+
+  1. Prediction/rollout accuracy -- does the model work at all.
+  2. Operator diagnostics on the *learned* W_turn_left / W_turn_right --
+     whether the Lie-parametrized operators the model was free to shape
+     happen to satisfy the algebraic relations turning implies (order 4,
+     mutual inverses). The group/interaction split itself is fixed by
+     construction (see src/model.py); this only checks whether training
+     pushed the group operators toward the "correct" rotations, which is
+     not guaranteed -- read the printed numbers, don't assume they're small.
 
 Usage:
     python validate.py
@@ -16,7 +23,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from src.environment import ACTION_NAMES, N_ACTIONS, OBS_DIM, sample_trajectories
+from src.environment import ACTION_NAMES, N_ACTIONS, N_GROUP_ACTIONS, OBS_DIM, STATE_DIM, sample_trajectories
 from src.model import WorldModel
 
 
@@ -25,31 +32,45 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint", type=str, default="checkpoint.pt")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=512)
-    p.add_argument("--horizon", type=int, default=8)
+    p.add_argument("--horizon", type=int, default=10)
     return p.parse_args()
 
 
 def load_model(path: str) -> WorldModel:
     ckpt = torch.load(path, map_location="cpu")
-    model = WorldModel(obs_dim=OBS_DIM, latent_dim=ckpt["latent_dim"], n_actions=N_ACTIONS)
+    model = WorldModel(
+        obs_dim=OBS_DIM,
+        state_dim=STATE_DIM,
+        latent_dim=ckpt["latent_dim"],
+        n_actions=N_ACTIONS,
+        n_group_actions=N_GROUP_ACTIONS,
+    )
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     return model
 
 
-def one_step_mse(model: WorldModel, obs: torch.Tensor, actions: torch.Tensor) -> float:
+def teacher_forced_accuracy(model: WorldModel, states, obs_seq, actions):
+    """One-step-at-a-time accuracy: the encoder re-observes the (partial) real
+    trajectory at every step, as during training."""
     with torch.no_grad():
-        pred = model.step(obs[:, 0], actions[:, 0])
-    return F.mse_loss(pred, obs[:, 1]).item()
+        preds = model.teacher_forced(obs_seq, actions)
+    targets = states[:, 1:]
+    mse = sum(F.mse_loss(preds[t], targets[:, t]) for t in range(actions.shape[1])) / actions.shape[1]
+    final_match = (preds[-1].round() == targets[:, -1]).all(dim=-1).float().mean().item()
+    return mse.item(), final_match
 
 
-def rollout_accuracy(model: WorldModel, obs: torch.Tensor, actions: torch.Tensor) -> float:
-    """Fraction of trajectories whose closed-loop rollout matches the true
-    observation (all fields, rounded to the nearest integer) at the final step."""
+def latent_rollout_accuracy(model: WorldModel, states, obs_seq, actions):
+    """Pure imagination: only obs_seq[:, 0] is ever encoded; every later state
+    comes from composing the transition on z alone, with no further
+    observations. Tests whether has_key/door_open -- never re-observed --
+    stay correct purely through latent composition of the operators."""
     with torch.no_grad():
-        preds = model.rollout(obs[:, 0], actions)
-    matched = (preds[-1].round() == obs[:, -1]).all(dim=-1)
-    return matched.float().mean().item()
+        preds = model.rollout(obs_seq[:, 0], actions)
+    targets = states[:, 1:]
+    final_match = (preds[-1].round() == targets[:, -1]).all(dim=-1).float().mean().item()
+    return final_match
 
 
 def main() -> None:
@@ -58,29 +79,31 @@ def main() -> None:
     rng = np.random.default_rng(args.seed)
 
     model = load_model(args.checkpoint)
-    obs, actions = sample_trajectories(args.batch_size, args.horizon, rng)
+    states, obs_seq, actions = sample_trajectories(args.batch_size, args.horizon, rng)
 
-    mse = one_step_mse(model, obs, actions)
-    acc = rollout_accuracy(model, obs, actions)
-    print(f"One-step prediction MSE: {mse:.5f}")
-    print(f"{args.horizon}-step rollout accuracy: {acc:.3f}\n")
+    tf_mse, tf_acc = teacher_forced_accuracy(model, states, obs_seq, actions)
+    ro_acc = latent_rollout_accuracy(model, states, obs_seq, actions)
+
+    print(f"Teacher-forced next-state MSE:        {tf_mse:.5f}")
+    print(f"Teacher-forced final-state accuracy:  {tf_acc:.3f}")
+    print(f"Latent-rollout final-state accuracy:  {ro_acc:.3f}  "
+          f"(pure imagination over {args.horizon} steps, obs seen once)\n")
 
     with torch.no_grad():
-        W = model.transition.W()               # (n_actions, D, D)
-        gate_p = model.transition.gate_probs()  # (n_actions, D)
+        W = model.transition.W()  # (N_GROUP_ACTIONS, D, D)
     D = W.shape[-1]
     I = torch.eye(D)
 
-    print(f"{'Action':<12} {'mean gate':>10} {'||W^4-I||':>12}")
-    for a, name in enumerate(ACTION_NAMES):
+    print(f"{'Action':<12} {'||W^4-I||':>12}")
+    for a in range(N_GROUP_ACTIONS):
         w4 = torch.linalg.matrix_power(W[a], 4)
         resid = (w4 - I).norm().item()
-        print(f"{name:<12} {gate_p[a].mean().item():>10.3f} {resid:>12.4f}")
+        print(f"{ACTION_NAMES[a]:<12} {resid:>12.4f}")
 
     left = ACTION_NAMES.index("turn_left")
     right = ACTION_NAMES.index("turn_right")
     inv_err = (W[right] @ W[left] - I).norm().item()
-    print(f"\nInverse error ||W_right W_left - I||: {inv_err:.4f}")
+    print(f"\nInverse error ||W_right @ W_left - I||: {inv_err:.4f}")
 
 
 if __name__ == "__main__":
