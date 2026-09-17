@@ -1,7 +1,7 @@
 # Group-Structured World Models
 
 A small PyTorch implementation exploring whether a learned world model can
-discover algebraic structure in actions directly from trajectories. This repository is a cleaned and simplified implementation based on a class project completed for Deep Learning for Doctoral Students at the University of Zurich (UZH).
+discover algebraic structure in actions directly from trajectories. 
 
 The model learns action-dependent latent transformations. Each action gets
 a linear operator in SO(D) plus a free residual network, mixed by a learned
@@ -57,8 +57,7 @@ See `notebooks/demo.ipynb` for an interactive walkthrough of a trained model.
 
 ## Background
 
-This project originated as a machine-learning course research project on
-group-structured latent dynamics and world models.
+This repository is a cleaned and simplified implementation based on a class project completed for Deep Learning for Doctoral Students at the University of Zurich (UZH).
 
 ## Language
 
