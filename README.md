@@ -57,8 +57,10 @@ See `notebooks/demo.ipynb` for an interactive walkthrough of a trained model.
 
 ## Background
 
-This project originated as a machine-learning course research project on
-group-structured latent dynamics and world models.
+This repository is a cleaned-up, standalone version of a class project for
+*Deep Learning for Doctoral Students* at the University of Zurich (UZH),
+isolating the core idea -- action-conditioned SO(D) operators with a learned
+free/group gate -- from the full experimental codebase.
 
 ## Language
 
